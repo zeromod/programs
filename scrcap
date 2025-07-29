@@ -1,149 +1,197 @@
 #!/bin/bash
 
-# Configuration
-OUTPUT_IMAGE_NAME="screencap.png" 
-HTML_VIEWER="image_viewer.html"
-DEFAULT_DELAY_SECONDS="1" # Unified delay for both ADB capture and browser refresh, now 1 second
-VERBOSE=false # Default to non-verbose
+# ==============================================================================
+# Live Android Screencap Viewer
+#
+# Captures all Android displays and shows them in a live-updating HTML viewer.
+# Features parallel capture, atomic file updates to prevent flicker, and a
+# self-correcting timer to prevent synchronization drift.
+#
+# Dependencies: adb, bc
+# Usage: ./live_screencap.sh [-v] [delay_seconds]
+# ==============================================================================
 
-# --- Argument Parsing ---
-# Loop through arguments to check for verbose flag and delay
-while [[ "$#" -gt 0 ]]; do
-    case "$1" in
-        -v|--verbose)
-            VERBOSE=true
-            shift # Consume the flag
-            ;;
-        *) # Any other argument is assumed to be the delay
-            if [[ -z "$DELAY_SECONDS" ]]; then # Only set if not already set
-                DELAY_SECONDS="$1"
-            fi
-            shift # Consume the argument
-            ;;
-    esac
-done
+# --- Configuration & Setup ---
+set -o errexit -o nounset -o pipefail
 
-# If delay not set by argument, use default
-if [[ -z "$DELAY_SECONDS" ]]; then
-    DELAY_SECONDS="$DEFAULT_DELAY_SECONDS"
-fi
+DEFAULT_DELAY_SECONDS="1"
+VERBOSE=false
 
-# --- Helper function for verbose output ---
+# --- Helper Functions ---
 log_verbose() {
-    if $VERBOSE; then
-        echo "$@"
-    fi
+    [[ "$VERBOSE" = true ]] && echo "VERBOSE: $@"
 }
 
-# --- Initial Information (now verbose only) ---
+cleanup() {
+    echo -e "\n\nShutting down..."
+    # Kill all child processes of this script.
+    # The check for TEMP_DIR's existence prevents errors if the script fails early.
+    if [[ -n "${TEMP_DIR-}" && -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    command -v pkill >/dev/null && pkill -P $$ &>/dev/null
+    echo "Cleanup complete."
+}
+
+# The main capture loop with a self-correcting timer.
+start_continuous_capture() {
+    local id=$1
+    local final_file="$TEMP_DIR/screencap_display_${id}.png"
+    local temp_file="${final_file}.tmp"
+
+    while true; do
+        local start_time
+        start_time=$(date +%s.%N)
+
+        log_verbose "Capturing Display $id -> ${temp_file}"
+        if adb exec-out screencap -p -d "$id" > "$temp_file" 2>/dev/null; then
+            mv "$temp_file" "$final_file"
+            log_verbose "Updated ${final_file}"
+        else
+            log_verbose "Capture failed for display $id. Retrying..."
+            sleep 1 && continue
+        fi
+
+        local end_time
+        end_time=$(date +%s.%N)
+        local duration
+        duration=$(echo "$end_time - $start_time" | bc)
+        
+        local sleep_duration
+        sleep_duration=$(echo "$DELAY_SECONDS - $duration" | bc)
+
+        if (( $(echo "$sleep_duration > 0" | bc -l) )); then
+            log_verbose "Capture took ${duration}s. Sleeping for ${sleep_duration}s."
+            sleep "$sleep_duration"
+        else
+            log_verbose "Capture took ${duration}s, longer than delay. Looping immediately."
+        fi
+    done
+}
+
+# --- Main Script Execution ---
+
+# Set up automatic cleanup on exit.
+trap cleanup SIGINT SIGTERM EXIT
+
+# --- Argument Parsing ---
+while getopts ":v" opt; do
+  case ${opt} in
+    v) VERBOSE=true ;;
+    *) echo "Invalid Option: -$OPTARG" >&2 && exit 1 ;;
+  esac
+done
+shift $((OPTIND -1))
+DELAY_SECONDS="${1:-$DEFAULT_DELAY_SECONDS}"
+
+# --- Dependency and Device Check ---
+if ! command -v adb &>/dev/null; then echo "ERROR: 'adb' not found." >&2; exit 1; fi
+if ! command -v bc &>/dev/null; then echo "ERROR: 'bc' not found." >&2; exit 1; fi
+
 log_verbose "Starting live screencap. Press Ctrl+C to stop."
-log_verbose "Unified delay set to: ${DELAY_SECONDS} seconds."
+log_verbose "Target interval: ${DELAY_SECONDS} seconds."
 
-# --- Create Temporary Directory ---
-# Create a unique temporary directory
-TEMP_DIR=$(mktemp -d -t adb_live_preview_XXXX)
+# --- Auto-Detect Display IDs ---
+log_verbose "Detecting display IDs..."
+# Using a portable `while read` loop for Zsh/macOS compatibility.
+DISPLAY_IDS=()
+while IFS= read -r id; do
+    [[ -n "$id" ]] && DISPLAY_IDS+=("$id")
+done < <(adb shell dumpsys SurfaceFlinger --display-id | awk '/^Display / {print $2}' | sort -n | uniq)
 
-# Check if temp directory was created successfully
-if [[ ! -d "$TEMP_DIR" ]]; then
-    echo "ERROR: Failed to create temporary directory." >&2 # This error is always printed
+if [[ ${#DISPLAY_IDS[@]} -eq 0 ]]; then
+    echo "ERROR: No Android displays detected via ADB." >&2
     exit 1
 fi
+log_verbose "Detected display IDs: ${DISPLAY_IDS[*]}"
 
-# Define file paths within the temporary directory
-OUTPUT_FILENAME="$TEMP_DIR/$OUTPUT_IMAGE_NAME"
+# --- Setup Environment ---
+TEMP_DIR=$(mktemp -d "${HOME}/.screencap_XXXXXX")
 HTML_VIEWER="$TEMP_DIR/image_viewer.html"
-
-log_verbose "Temporary directory created: $TEMP_DIR"
-log_verbose "Output image path: $OUTPUT_FILENAME"
-log_verbose "HTML viewer path: $HTML_VIEWER"
-
-# --- Cleanup on Exit ---
-# Use a trap to ensure the temporary directory is removed when the script exits,
-# whether due to success, error, or Ctrl+C.
-trap 'log_verbose "Cleaning up temporary directory: $TEMP_DIR"; rm -rf "$TEMP_DIR"; exit' EXIT HUP INT QUIT TERM
+log_verbose "Temp directory: $TEMP_DIR"
 
 # --- HTML File Generation ---
-# HTML file is now ALWAYS rewritten to ensure the delay is current
-log_verbose "Generating '$HTML_VIEWER' with current delay: ${DELAY_SECONDS}s..."
+JS_DISPLAY_DATA=""
+for id in "${DISPLAY_IDS[@]}"; do
+    JS_DISPLAY_DATA+=" { id: '${id}', url: 'file://${TEMP_DIR}/screencap_display_${id}.png' },"
+done
+
+NUM_DISPLAYS=${#DISPLAY_IDS[@]}
+CANVAS_MAX_WIDTH="calc((100vw - $((NUM_DISPLAYS - 1)) * 10px) / $NUM_DISPLAYS)"
+
+log_verbose "Generating '$HTML_VIEWER'..."
 cat <<EOF > "$HTML_VIEWER"
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Device Preview</title>
     <style>
-        body {
-            margin: 0;
-            overflow: hidden;
-            background-color: #000; /* Optional: black background */
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-        }
-        canvas {
-            display: block;
-            /* Maintain aspect ratio and fit to window */
-            max-width: 100vw;
-            max-height: 100vh;
-            image-rendering: -webkit-optimize-contrast;
-            image-rendering: crisp-edges;
-        }
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; display: flex; justify-content: center; align-items: center; min-height: 100vh; gap: 10px; }
+        canvas { display: block; max-width: ${CANVAS_MAX_WIDTH}; max-height: 100vh; object-fit: contain; image-rendering: pixelated; }
     </style>
+</head>
+<body>
     <script>
-        let canvas, ctx;
-        let lastKnownWidth = 0;
-        let lastKnownHeight = 0;
+        const displayData = [${JS_DISPLAY_DATA%,}];
+        const canvases = {};
+        const contexts = {};
+        const imageCache = {};
 
-        function refreshImage() {
-            // Updated image URL to screencap.png
-            const imageUrl = '${OUTPUT_IMAGE_NAME}'; 
-            const img = new Image();
-
+        function loadImageForDisplay(data) {
+            const img = imageCache[data.id] = imageCache[data.id] || new Image();
             img.onload = () => {
-                if (img.width !== lastKnownWidth || img.height !== lastKnownHeight) {
-                    canvas.width = img.width;
-                    canvas.height = img.height;
-                    lastKnownWidth = img.width;
-                    lastKnownHeight = img.height;
+                const canvas = canvases[data.id];
+                const ctx = contexts[data.id];
+                if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                    canvas.width = img.naturalWidth || 300;
+                    canvas.height = img.naturalHeight || 200;
                 }
                 ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
             };
-
             img.onerror = () => {
-                console.error("Failed to load image:", img.src);
+                console.warn(\`Failed to load image for display \${data.id}. Will retry.\`);
             };
-
-            img.src = imageUrl + '?' + new Date().getTime();
+            img.src = data.url + '?' + Date.now();
         }
 
         document.addEventListener('DOMContentLoaded', () => {
-            canvas = document.getElementById('liveCanvas');
-            ctx = canvas.getContext('2d');
-            // This delaySeconds now comes directly from the generated HTML
-            const delaySeconds = parseFloat(document.body.dataset.refreshDelay || "0.1");
-            refreshImage();
-            setInterval(refreshImage, delaySeconds * 1000);
+            const fragment = document.createDocumentFragment();
+            displayData.forEach(data => {
+                const canvas = document.createElement('canvas');
+                canvases[data.id] = canvas;
+                contexts[data.id] = canvas.getContext('2d');
+                fragment.appendChild(canvas);
+            });
+            document.body.appendChild(fragment);
+
+            displayData.forEach(loadImageForDisplay);
+
+            setTimeout(() => {
+                setInterval(() => displayData.forEach(loadImageForDisplay), ${DELAY_SECONDS} * 1000);
+            }, 300);
         });
     </script>
-</head>
-<body data-refresh-delay="${DELAY_SECONDS}"> 
-<canvas id="liveCanvas"></canvas>
 </body>
 </html>
 EOF
 
-# Attempt to open the HTML file in the default browser
-log_verbose "Opening live preview in browser..."
-open "$HTML_VIEWER" & # 'open' command opens files with their default application
-
-# Give browser a moment to launch
-sleep 1
-
-while true; do
-    # Capture screenshot and save directly to local file
-    # Ensure adb is writing to the correct path in the temp directory
-    adb exec-out screencap -p > "$OUTPUT_FILENAME" 2>/dev/null
-
-    # Add the unified delay
-    sleep "$DELAY_SECONDS"
+# --- Initial Capture, Browser Launch, and Main Loop ---
+echo "Performing initial capture..."
+for id in "${DISPLAY_IDS[@]}"; do
+    adb exec-out screencap -p -d "$id" > "$TEMP_DIR/screencap_display_${id}.png" 2>/dev/null || true
 done
+echo "Initial capture complete."
+
+log_verbose "Opening viewer: $HTML_VIEWER"
+if command -v xdg-open &>/dev/null; then xdg-open "$HTML_VIEWER" &
+elif command -v open &>/dev/null; then open "$HTML_VIEWER" &
+else echo "Please open this file in your browser: $HTML_VIEWER" >&2; fi
+
+for id in "${DISPLAY_IDS[@]}"; do
+    start_continuous_capture "$id" &
+done
+
+echo "All capture processes started. Viewer is active. Press Ctrl+C to stop."
+wait
