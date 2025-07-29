@@ -1,19 +1,70 @@
 #!/bin/bash
 
 # Configuration
-OUTPUT_FILENAME="live_preview.png"
+OUTPUT_IMAGE_NAME="screencap.png" 
 HTML_VIEWER="image_viewer.html"
-DEFAULT_DELAY_SECONDS="0.1" # Unified delay for both ADB capture and browser refresh
+DEFAULT_DELAY_SECONDS="1" # Unified delay for both ADB capture and browser refresh, now 1 second
+VERBOSE=false # Default to non-verbose
 
-# Get delay from argument, or use default
-DELAY_SECONDS=${1:-$DEFAULT_DELAY_SECONDS}
+# --- Argument Parsing ---
+# Loop through arguments to check for verbose flag and delay
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)
+            VERBOSE=true
+            shift # Consume the flag
+            ;;
+        *) # Any other argument is assumed to be the delay
+            if [[ -z "$DELAY_SECONDS" ]]; then # Only set if not already set
+                DELAY_SECONDS="$1"
+            fi
+            shift # Consume the argument
+            ;;
+    esac
+done
 
-echo "Starting live screencap with a unified delay of ${DELAY_SECONDS} seconds. Press Ctrl+C to stop."
-echo "Output will be saved to: $OUTPUT_FILENAME"
+# If delay not set by argument, use default
+if [[ -z "$DELAY_SECONDS" ]]; then
+    DELAY_SECONDS="$DEFAULT_DELAY_SECONDS"
+fi
+
+# --- Helper function for verbose output ---
+log_verbose() {
+    if $VERBOSE; then
+        echo "$@"
+    fi
+}
+
+# --- Initial Information (now verbose only) ---
+log_verbose "Starting live screencap. Press Ctrl+C to stop."
+log_verbose "Unified delay set to: ${DELAY_SECONDS} seconds."
+
+# --- Create Temporary Directory ---
+# Create a unique temporary directory
+TEMP_DIR=$(mktemp -d -t adb_live_preview_XXXX)
+
+# Check if temp directory was created successfully
+if [[ ! -d "$TEMP_DIR" ]]; then
+    echo "ERROR: Failed to create temporary directory." >&2 # This error is always printed
+    exit 1
+fi
+
+# Define file paths within the temporary directory
+OUTPUT_FILENAME="$TEMP_DIR/$OUTPUT_IMAGE_NAME"
+HTML_VIEWER="$TEMP_DIR/image_viewer.html"
+
+log_verbose "Temporary directory created: $TEMP_DIR"
+log_verbose "Output image path: $OUTPUT_FILENAME"
+log_verbose "HTML viewer path: $HTML_VIEWER"
+
+# --- Cleanup on Exit ---
+# Use a trap to ensure the temporary directory is removed when the script exits,
+# whether due to success, error, or Ctrl+C.
+trap 'log_verbose "Cleaning up temporary directory: $TEMP_DIR"; rm -rf "$TEMP_DIR"; exit' EXIT HUP INT QUIT TERM
 
 # --- HTML File Generation ---
 # HTML file is now ALWAYS rewritten to ensure the delay is current
-echo "Rewriting '$HTML_VIEWER' with current delay: ${DELAY_SECONDS}s..."
+log_verbose "Generating '$HTML_VIEWER' with current delay: ${DELAY_SECONDS}s..."
 cat <<EOF > "$HTML_VIEWER"
 <!DOCTYPE html>
 <html>
@@ -44,7 +95,8 @@ cat <<EOF > "$HTML_VIEWER"
         let lastKnownHeight = 0;
 
         function refreshImage() {
-            const imageUrl = 'live_preview.png';
+            // Updated image URL to screencap.png
+            const imageUrl = '${OUTPUT_IMAGE_NAME}'; 
             const img = new Image();
 
             img.onload = () => {
@@ -74,14 +126,14 @@ cat <<EOF > "$HTML_VIEWER"
         });
     </script>
 </head>
-<body data-refresh-delay="${DELAY_SECONDS}"> <canvas id="liveCanvas"></canvas>
+<body data-refresh-delay="${DELAY_SECONDS}"> 
+<canvas id="liveCanvas"></canvas>
 </body>
 </html>
 EOF
-# --- End HTML File Generation ---
 
 # Attempt to open the HTML file in the default browser
-echo "Attempting to open '$HTML_VIEWER' in default browser..."
+log_verbose "Opening live preview in browser..."
 open "$HTML_VIEWER" & # 'open' command opens files with their default application
 
 # Give browser a moment to launch
@@ -89,6 +141,7 @@ sleep 1
 
 while true; do
     # Capture screenshot and save directly to local file
+    # Ensure adb is writing to the correct path in the temp directory
     adb exec-out screencap -p > "$OUTPUT_FILENAME" 2>/dev/null
 
     # Add the unified delay
