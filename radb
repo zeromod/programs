@@ -1,0 +1,158 @@
+#!/bin/bash
+
+# Configuration
+LOCAL_ADB_PORT=5038
+REMOTE_ADB_PORT=5037
+LOCAL_SCRCPY_PORT=27183
+REMOTE_SCRCPY_PORT=27183
+
+# Initialize variables
+REMOTE_USER_IP=""
+RUN_SCRCPY=0 # Default to not running scrcpy
+
+# Parse command-line arguments
+while getopts ":s" opt; do
+  case $opt in
+    s)
+      RUN_SCRCPY=1 # Set flag to run scrcpy
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+# Shift positional parameters so that $1 refers to the first non-option argument
+shift $((OPTIND-1))
+
+# Get REMOTE_USER_IP from the remaining command-line argument
+if [ -z "$1" ]; then
+  echo "Missing remote; Usage: $0 [-s] remote_user_name@remote_ip"
+  exit 1
+fi
+REMOTE_USER_IP="$1"
+
+# Check if LOCAL_ADB_PORT is in use and kill the process if it is
+if lsof -i :"${LOCAL_ADB_PORT}" >/dev/null 2>&1; then
+  echo "Port ${LOCAL_ADB_PORT} is in use. Attempting to kill the process..."
+  # Find the PID using the port and kill it
+  lsof -ti :"${LOCAL_ADB_PORT}" | xargs kill -9 2>/dev/null
+  sleep 1 # Give the process a moment to terminate
+  if lsof -i :"${LOCAL_ADB_PORT}" >/dev/null 2>&1; then
+    echo "Failed to kill process using port ${LOCAL_ADB_PORT}. Exiting."
+    exit 1
+  fi
+  echo "Process using port ${LOCAL_ADB_PORT} killed."
+fi
+
+# SSH Tunnel Setup (background process)
+echo "Setting up SSH tunnel..."
+# -C: Compression (optional, can speed up slow connections)
+# -N: Do not execute a remote command (only forward ports)
+# -L: Local port forwarding (LOCAL_PORT:REMOTE_HOST:REMOTE_PORT)
+ssh -CN -L"$LOCAL_ADB_PORT:localhost:$REMOTE_ADB_PORT" -L"$LOCAL_SCRCPY_PORT:localhost:$REMOTE_SCRCPY_PORT" "$REMOTE_USER_IP" &
+SSH_PID=$! # Capture the PID of the background SSH process
+echo "SSH tunnel process started with PID: $SSH_PID"
+sleep 2 # Give the SSH tunnel a moment to establish
+
+# Set up a trap to ensure the SSH tunnel is killed when the script exits
+# This handles normal exits, errors, and user interruptions (e.g., Ctrl+C)
+trap "echo 'Script interrupted. Cleaning up SSH tunnel (PID: $SSH_PID)...'; kill '$SSH_PID' 2>/dev/null; wait '$SSH_PID' 2>/dev/null; echo 'SSH tunnel cleanup complete.'" EXIT
+
+# ADB Setup
+echo "Setting up ADB..."
+# We no longer kill the remote ADB server here. The tunnel connects to an existing one.
+export ADB_SERVER_SOCKET="tcp:localhost:$LOCAL_ADB_PORT" # Direct ADB client to use the tunnel
+echo "ADB_SERVER_SOCKET set to $ADB_SERVER_SOCKET"
+
+# Always print instructions for other terminals
+echo ""
+echo "--------------------------------------------------------------------------------"
+echo "To use 'adb' commands for remote devices in other terminals, run this command:"
+echo "  export ADB_SERVER_SOCKET=\"tcp:localhost:$LOCAL_ADB_PORT\""
+echo "Then, you can run 'adb devices' or other 'adb' commands in that terminal."
+echo "--------------------------------------------------------------------------------"
+echo ""
+
+# Device Listing (always show available devices by querying remote directly)
+echo "Querying remote devices..."
+# Execute 'adb devices -l' directly on the remote machine via SSH
+# This ensures we get the list of devices that the remote ADB server actually sees.
+REMOTE_DEVICES_OUTPUT=$(ssh "$REMOTE_USER_IP" "adb devices -l")
+echo "Remote ADB devices output:"
+echo "$REMOTE_DEVICES_OUTPUT"
+
+# Extract device serials (IP:Port format) from the remote output
+devices=$(echo "$REMOTE_DEVICES_OUTPUT" | grep -v 'List of devices attached' | awk '{print $1}' | grep -v '^$')
+
+if [ -z "$devices" ]; then
+    echo "Error: No ADB devices found on the remote machine. Please ensure devices are connected and ADB server is running on your remote machine."
+    # The trap will handle SSH_PID cleanup on exit
+    exit 1
+fi
+
+# Scrcpy Setup (conditional execution and device selection)
+if [ "$RUN_SCRCPY" -eq 1 ]; then
+  device_array=($devices) # Store devices in an array
+  SCRCPY_PIDS=() # Array to hold PIDs of background scrcpy processes
+
+  # If multiple devices are found, prompt the user to select one or all
+  if [[ ${#device_array[@]} -gt 1 ]]; then
+      echo "Multiple devices detected. Please select one for Scrcpy or 'a' for all:"
+      for i in "${!device_array[@]}"; do
+          echo "$((i + 1))) ${device_array[i]}"
+      done
+      echo "a) All devices"
+
+      echo -n "Enter your choice (1-${#device_array[@]} or 'a'): "
+      read -n 1 choice # Read a single character for selection
+      echo "" # Add a newline after read -n 1
+
+      # Validate user input
+      if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ "$choice" -le ${#device_array[@]} ]]; then
+          DEVICE_SERIAL="${device_array[$((choice - 1))]}" # Get the selected device serial
+          echo "Starting Scrcpy with device: $DEVICE_SERIAL"
+          # Scrcpy will use ADB_SERVER_SOCKET to connect via the tunnel
+          scrcpy -s "$DEVICE_SERIAL" --force-adb-forward
+          echo "Scrcpy exited."
+      elif [[ "$choice" == "a" || "$choice" == "A" ]]; then
+          echo "Starting Scrcpy for all detected devices..."
+          for dev_serial in "${device_array[@]}"; do
+              echo "Launching Scrcpy for device: $dev_serial"
+              # Run scrcpy in the background for each device
+              scrcpy -s "$dev_serial" --force-adb-forward &
+              SCRCPY_PIDS+=($!) # Add the PID to the array
+          done
+          echo "All Scrcpy instances launched. Waiting for them to exit..."
+          # Wait for all background scrcpy processes to finish
+          for pid in "${SCRCPY_PIDS[@]}"; do
+              wait "$pid"
+              echo "Scrcpy instance with PID $pid exited."
+          done
+          echo "All Scrcpy instances have exited."
+      else
+          echo "Invalid selection. Exiting."
+          # The trap will handle SSH_PID cleanup on exit
+          exit 1
+      fi
+  else
+      DEVICE_SERIAL="${device_array[0]}" # If only one device, automatically select it
+      echo "Only one device detected: $DEVICE_SERIAL. Continuing with Scrcpy."
+      echo "Starting Scrcpy with device: $DEVICE_SERIAL"
+      scrcpy -s "$DEVICE_SERIAL" --force-adb-forward
+      echo "Scrcpy exited."
+  fi
+  # The trap will handle SSH_PID cleanup when this script exits
+else
+  echo "Scrcpy was not requested (use -s option to run it)."
+  echo "The SSH tunnel (PID: $SSH_PID) is active."
+  echo "Press Ctrl+C to close the tunnel and exit this script."
+  # Keep the script running indefinitely to maintain the tunnel until Ctrl+C
+  while true; do
+    sleep 1
+  done
+fi
+
+# The 'trap EXIT' command at the beginning of the script will automatically
+# execute the cleanup commands when the script finishes or exits.
+

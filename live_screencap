@@ -1,0 +1,96 @@
+#!/bin/bash
+
+# Configuration
+OUTPUT_FILENAME="live_preview.png"
+HTML_VIEWER="image_viewer.html"
+DEFAULT_DELAY_SECONDS="0.1" # Unified delay for both ADB capture and browser refresh
+
+# Get delay from argument, or use default
+DELAY_SECONDS=${1:-$DEFAULT_DELAY_SECONDS}
+
+echo "Starting live screencap with a unified delay of ${DELAY_SECONDS} seconds. Press Ctrl+C to stop."
+echo "Output will be saved to: $OUTPUT_FILENAME"
+
+# --- HTML File Generation ---
+# HTML file is now ALWAYS rewritten to ensure the delay is current
+echo "Rewriting '$HTML_VIEWER' with current delay: ${DELAY_SECONDS}s..."
+cat <<EOF > "$HTML_VIEWER"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Device Preview</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000; /* Optional: black background */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        canvas {
+            display: block;
+            /* Maintain aspect ratio and fit to window */
+            max-width: 100vw;
+            max-height: 100vh;
+            image-rendering: -webkit-optimize-contrast;
+            image-rendering: crisp-edges;
+        }
+    </style>
+    <script>
+        let canvas, ctx;
+        let lastKnownWidth = 0;
+        let lastKnownHeight = 0;
+
+        function refreshImage() {
+            const imageUrl = 'live_preview.png';
+            const img = new Image();
+
+            img.onload = () => {
+                if (img.width !== lastKnownWidth || img.height !== lastKnownHeight) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    lastKnownWidth = img.width;
+                    lastKnownHeight = img.height;
+                }
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            };
+
+            img.onerror = () => {
+                console.error("Failed to load image:", img.src);
+            };
+
+            img.src = imageUrl + '?' + new Date().getTime();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            canvas = document.getElementById('liveCanvas');
+            ctx = canvas.getContext('2d');
+            // This delaySeconds now comes directly from the generated HTML
+            const delaySeconds = parseFloat(document.body.dataset.refreshDelay || "0.1");
+            refreshImage();
+            setInterval(refreshImage, delaySeconds * 1000);
+        });
+    </script>
+</head>
+<body data-refresh-delay="${DELAY_SECONDS}"> <canvas id="liveCanvas"></canvas>
+</body>
+</html>
+EOF
+# --- End HTML File Generation ---
+
+# Attempt to open the HTML file in the default browser
+echo "Attempting to open '$HTML_VIEWER' in default browser..."
+open "$HTML_VIEWER" & # 'open' command opens files with their default application
+
+# Give browser a moment to launch
+sleep 1
+
+while true; do
+    # Capture screenshot and save directly to local file
+    adb exec-out screencap -p > "$OUTPUT_FILENAME" 2>/dev/null
+
+    # Add the unified delay
+    sleep "$DELAY_SECONDS"
+done
