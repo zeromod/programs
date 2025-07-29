@@ -5,7 +5,7 @@
 #
 # Captures all Android displays and shows them in a live-updating HTML viewer.
 # Features parallel capture, atomic file updates to prevent flicker, and a
-# self-correcting timer to prevent synchronization drift.
+# self-correcting timer on Linux to prevent synchronization drift.
 #
 # Dependencies: adb, bc
 # Usage: ./live_screencap.sh [-v] [delay_seconds]
@@ -19,29 +19,38 @@ VERBOSE=false
 
 # --- Helper Functions ---
 log_verbose() {
-    [[ "$VERBOSE" = true ]] && echo "VERBOSE: $@"
+    # This `if` structure is used to be safe with `set -o errexit`.
+    if [[ "$VERBOSE" = true ]]; then
+        echo "VERBOSE: $@"
+    fi
 }
 
 cleanup() {
     echo -e "\n\nShutting down..."
-    # Kill all child processes of this script.
     # The check for TEMP_DIR's existence prevents errors if the script fails early.
     if [[ -n "${TEMP_DIR-}" && -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR"
     fi
+    # Kill all child processes of this script.
     command -v pkill >/dev/null && pkill -P $$ &>/dev/null
     echo "Cleanup complete."
 }
 
-# The main capture loop with a self-correcting timer.
+# The main capture loop with a self-correcting timer for Linux.
 start_continuous_capture() {
     local id=$1
     local final_file="$TEMP_DIR/screencap_display_${id}.png"
     local temp_file="${final_file}.tmp"
+    local is_macos=false
+    if [[ "$(uname)" == "Darwin" ]]; then
+        is_macos=true
+    fi
 
     while true; do
-        local start_time
-        start_time=$(date +%s.%N)
+        local start_time=0
+        if [[ "$is_macos" = false ]]; then
+            start_time=$(date +%s.%N)
+        fi
 
         log_verbose "Capturing Display $id -> ${temp_file}"
         if adb exec-out screencap -p -d "$id" > "$temp_file" 2>/dev/null; then
@@ -52,19 +61,25 @@ start_continuous_capture() {
             sleep 1 && continue
         fi
 
-        local end_time
-        end_time=$(date +%s.%N)
-        local duration
-        duration=$(echo "$end_time - $start_time" | bc)
-        
-        local sleep_duration
-        sleep_duration=$(echo "$DELAY_SECONDS - $duration" | bc)
-
-        if (( $(echo "$sleep_duration > 0" | bc -l) )); then
-            log_verbose "Capture took ${duration}s. Sleeping for ${sleep_duration}s."
-            sleep "$sleep_duration"
+        if [[ "$is_macos" = true ]]; then
+            # macOS fallback: simple sleep, no self-correction.
+            sleep "$DELAY_SECONDS"
         else
-            log_verbose "Capture took ${duration}s, longer than delay. Looping immediately."
+            # Linux: self-correcting timer.
+            local end_time
+            end_time=$(date +%s.%N)
+            local duration
+            duration=$(echo "$end_time - $start_time" | bc)
+            
+            local sleep_duration
+            sleep_duration=$(echo "$DELAY_SECONDS - $duration" | bc)
+
+            if (( $(echo "$sleep_duration > 0" | bc -l) )); then
+                log_verbose "Capture took ${duration}s. Sleeping for ${sleep_duration}s."
+                sleep "$sleep_duration"
+            else
+                log_verbose "Capture took ${duration}s, longer than delay. Looping immediately."
+            fi
         fi
     done
 }
